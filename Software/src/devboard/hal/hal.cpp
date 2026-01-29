@@ -23,6 +23,9 @@ void init_hal() {
 #elif defined(HW_DEVKIT)
 #include "hw_devkit.h"
   esp32hal = new DevKitHal();
+#elif defined(HW_6CH_RELAY_S3)
+#include "hw_6ch_relay_s3.h"
+  esp32hal = new Relay6chS3Hal();
 #else
 #error "No HW defined."
 #endif
