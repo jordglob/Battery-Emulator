@@ -53,6 +53,7 @@ enum class BatteryType {
   CmpSmartCar = 45,
   ThinkCity = 47,
   TeslaLegacy = 48,
+  ChademoV2H = 49,  // CHAdeMO V2H bidirectional discharge mode
   Highest
 };
 

@@ -58,6 +58,8 @@ const char* name_for_battery_type(BatteryType type) {
       return CellPowerBms::Name;
     case BatteryType::Chademo:
       return ChademoBattery::Name;
+    case BatteryType::ChademoV2H:
+      return ChademoV2HBattery::Name;
     case BatteryType::CmfaEv:
       return CmfaEvBattery::Name;
     case BatteryType::CmpSmartCar:
@@ -169,6 +171,8 @@ Battery* create_battery(BatteryType type) {
       return new CellPowerBms();
     case BatteryType::Chademo:
       return new ChademoBattery();
+    case BatteryType::ChademoV2H:
+      return new ChademoV2HBattery();
     case BatteryType::CmfaEv:
       return new CmfaEvBattery();
     case BatteryType::CmpSmartCar:
