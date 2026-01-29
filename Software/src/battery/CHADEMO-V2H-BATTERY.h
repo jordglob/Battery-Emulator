@@ -38,49 +38,39 @@
 #include "CanBattery.h"
 
 /* ============================================================================
- *                    GPIO PIN DEFINITIONS - WAVESHARE ESP32
+ *                    KRAFTKRANEN v2.0 HARDWARE MAPPING
  * ============================================================================
- * These pins are suggested defaults for Waveshare ESP32 boards.
- * Adjust according to your specific hardware configuration.
+ * Waveshare ESP32-S3-Relay-6CH board configuration for CHAdeMO V2H.
  *
- * CHAdeMO Connector Pin Reference:
- * - Pin 2 (d1): EVSE ready signal output (EVSE -> Vehicle)
- * - Pin 4 (j):  Charge permission input (Vehicle -> EVSE)
- * - Pin 7 (PP): Proximity/plug detection input
- * - Pin 10 (k): Charge enable output (EVSE -> Vehicle)
- * - Lock:       Connector lock solenoid control
+ * RELAY OUTPUTS (12V via relay COM):
+ * - Relay 1 (GPIO 4):  Nissan Main+ Contactor coil
+ * - Relay 2 (GPIO 5):  Nissan Main- Contactor coil
+ * - Relay 3 (GPIO 6):  Nissan Precharge Relay coil
+ * - Relay 4 (GPIO 7):  CHAdeMO Pin 2 (d1) - "Charger Start" signal
+ * - Relay 5 (GPIO 15): CHAdeMO Pin 7 - Connector Lock solenoid
+ * - Relay 6 (GPIO 16): Spare (cooling fan)
+ *
+ * INPUTS:
+ * - GPIO 9:  CHAdeMO Pin 4 (j) - Vehicle Enable (12V via voltage divider)
+ * - GPIO 10: ACS758 Current Sensor (ADC)
+ *
+ * PRECHARGE SEQUENCE:
+ * 1. Lock (R5) -> Start Signal (R4)
+ * 2. Wait for CAN + Vehicle Enable
+ * 3. Main- (R2) + Precharge (R3)
+ * 4. Wait 3 seconds
+ * 5. Main+ (R1) -> Disengage Precharge (R3)
  */
 
-// Default GPIO mappings for Waveshare ESP32-S3
-// These can be overridden in platformio.ini or hardware HAL
-#ifndef CHADEMO_V2H_PIN_2_DEFAULT
-#define CHADEMO_V2H_PIN_2_DEFAULT   GPIO_NUM_4   // EVSE Ready (d1) - OUTPUT
-#endif
+// Kraftkranen precharge timing
+#define KRAFTKRANEN_PRECHARGE_TIME_MS     3000   // 3 seconds for Deye caps
+#define KRAFTKRANEN_CONTACTOR_DELAY_MS    100    // Delay between relay operations
 
-#ifndef CHADEMO_V2H_PIN_4_DEFAULT
-#define CHADEMO_V2H_PIN_4_DEFAULT   GPIO_NUM_5   // Vehicle Permission (j) - INPUT
-#endif
-
-#ifndef CHADEMO_V2H_PIN_7_DEFAULT
-#define CHADEMO_V2H_PIN_7_DEFAULT   GPIO_NUM_6   // Proximity Detection (PP) - INPUT
-#endif
-
-#ifndef CHADEMO_V2H_PIN_10_DEFAULT
-#define CHADEMO_V2H_PIN_10_DEFAULT  GPIO_NUM_7   // Charge Enable (k) - OUTPUT
-#endif
-
-#ifndef CHADEMO_V2H_LOCK_DEFAULT
-#define CHADEMO_V2H_LOCK_DEFAULT    GPIO_NUM_15  // Connector Lock - OUTPUT
-#endif
-
-// Precharge and Contactor pins (typically shared with main system)
-#ifndef CHADEMO_V2H_PRECHARGE_DEFAULT
-#define CHADEMO_V2H_PRECHARGE_DEFAULT          GPIO_NUM_16  // Precharge relay - OUTPUT
-#endif
-
-#ifndef CHADEMO_V2H_POSITIVE_CONTACTOR_DEFAULT
-#define CHADEMO_V2H_POSITIVE_CONTACTOR_DEFAULT GPIO_NUM_17  // Main positive contactor - OUTPUT
-#endif
+// ACS758 Current Sensor calibration
+#define ACS758_SENSITIVITY_MV_PER_A       40     // 40mV/A for ACS758-50A
+#define ACS758_ZERO_CURRENT_MV            2500   // 2.5V at 0A (Vcc/2)
+#define ADC_RESOLUTION                    4095   // 12-bit ADC
+#define ADC_REFERENCE_MV                  3300   // 3.3V reference
 
 /* ============================================================================
  *                         TIMING CONSTANTS
@@ -180,14 +170,16 @@ public:
   static constexpr const char* Name = "CHAdeMO V2H Discharge Mode";
 
 private:
-  /* ========== GPIO Pins ========== */
-  gpio_num_t pin_d1;           // Pin 2 - EVSE ready signal (output)
-  gpio_num_t pin_j;            // Pin 4 - Vehicle permission (input)
-  gpio_num_t pin_pp;           // Pin 7 - Proximity detection (input)
-  gpio_num_t pin_k;            // Pin 10 - Charge enable (output)
-  gpio_num_t pin_lock;         // Connector lock solenoid (output)
-  gpio_num_t pin_precharge;    // Precharge relay (output)
-  gpio_num_t pin_contactor;    // Main contactor (output)
+  /* ========== Kraftkranen Relay Outputs ========== */
+  gpio_num_t relay_main_pos;   // Relay 1 (GPIO 4): Nissan Main+ contactor
+  gpio_num_t relay_main_neg;   // Relay 2 (GPIO 5): Nissan Main- contactor
+  gpio_num_t relay_precharge;  // Relay 3 (GPIO 6): Precharge relay
+  gpio_num_t relay_d1;         // Relay 4 (GPIO 7): CHAdeMO Pin 2 "Charger Start"
+  gpio_num_t relay_lock;       // Relay 5 (GPIO 15): CHAdeMO Pin 7 Lock solenoid
+
+  /* ========== Kraftkranen Inputs ========== */
+  gpio_num_t pin_vehicle_enable;  // GPIO 9: CHAdeMO Pin 4 (j) - 12V via divider
+  gpio_num_t pin_current_sensor;  // GPIO 10: ACS758 Hall sensor (ADC)
 
   /* ========== State Machine ========== */
   ChademoV2HState currentState;

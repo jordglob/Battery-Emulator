@@ -42,14 +42,16 @@ ChademoV2HBattery::ChademoV2HBattery()
     measuredVoltage(0),
     measuredCurrent(0)
 {
-  // Initialize GPIO pins from HAL or use defaults
-  pin_d1        = esp32hal->CHADEMO_PIN_2();
-  pin_j         = esp32hal->CHADEMO_PIN_4();
-  pin_pp        = esp32hal->CHADEMO_PIN_7();
-  pin_k         = esp32hal->CHADEMO_PIN_10();
-  pin_lock      = esp32hal->CHADEMO_LOCK();
-  pin_precharge = esp32hal->PRECHARGE_PIN();
-  pin_contactor = esp32hal->POSITIVE_CONTACTOR_PIN();
+  // Initialize Kraftkranen relay outputs from HAL
+  relay_main_pos   = esp32hal->POSITIVE_CONTACTOR_PIN();  // Relay 1: Nissan Main+
+  relay_main_neg   = esp32hal->NEGATIVE_CONTACTOR_PIN();  // Relay 2: Nissan Main-
+  relay_precharge  = esp32hal->PRECHARGE_PIN();           // Relay 3: Precharge
+  relay_d1         = esp32hal->CHADEMO_PIN_2();           // Relay 4: CHAdeMO Pin 2 (d1)
+  relay_lock       = esp32hal->CHADEMO_LOCK();            // Relay 5: CHAdeMO Pin 7 Lock
+
+  // Initialize Kraftkranen inputs from HAL
+  pin_vehicle_enable = esp32hal->CHADEMO_PIN_4();         // Vehicle Enable input
+  pin_current_sensor = esp32hal->CURRENT_SENSOR_PIN();    // ACS758 ADC input
 
   // Initialize CAN frames with default values
   canFrame_108 = {.FD = false, .ext_ID = false, .DLC = 8, .ID = 0x108,
@@ -92,26 +94,38 @@ ChademoV2HBattery::ChademoV2HBattery()
  * initializes the CHAdeMO V2H state machine.
  */
 void ChademoV2HBattery::setup(void) {
-  // Allocate GPIO pins - fail gracefully if not available
-  if (!esp32hal->alloc_pins(Name, pin_d1, pin_k, pin_j, pin_pp, pin_lock)) {
-    logging.println("CHAdeMO V2H: Failed to allocate GPIO pins");
+  // Allocate Kraftkranen relay output pins
+  if (!esp32hal->alloc_pins(Name, relay_main_pos, relay_main_neg, relay_precharge,
+                            relay_d1, relay_lock)) {
+    logging.println("CHAdeMO V2H: Failed to allocate relay pins");
     set_event(EVENT_GPIO_NOT_DEFINED, 0);
     return;
   }
 
-  // Configure output pins
-  pinMode(pin_d1, OUTPUT);
-  digitalWrite(pin_d1, LOW);   // EVSE not ready initially
+  // Configure relay outputs - all OFF initially (Normally Open relays)
+  pinMode(relay_main_pos, OUTPUT);
+  digitalWrite(relay_main_pos, LOW);   // Relay 1: Main+ OFF
 
-  pinMode(pin_k, OUTPUT);
-  digitalWrite(pin_k, LOW);    // Charge enable off
+  pinMode(relay_main_neg, OUTPUT);
+  digitalWrite(relay_main_neg, LOW);   // Relay 2: Main- OFF
 
-  pinMode(pin_lock, OUTPUT);
-  digitalWrite(pin_lock, LOW); // Connector unlocked
+  pinMode(relay_precharge, OUTPUT);
+  digitalWrite(relay_precharge, LOW);  // Relay 3: Precharge OFF
+
+  pinMode(relay_d1, OUTPUT);
+  digitalWrite(relay_d1, LOW);         // Relay 4: CHAdeMO d1 OFF
+
+  pinMode(relay_lock, OUTPUT);
+  digitalWrite(relay_lock, LOW);       // Relay 5: Lock OFF
 
   // Configure input pins
-  pinMode(pin_j, INPUT);       // Vehicle permission signal
-  pinMode(pin_pp, INPUT);      // Proximity/plug detection
+  pinMode(pin_vehicle_enable, INPUT);  // CHAdeMO Pin 4 (j) - Vehicle Enable
+
+  // Configure ADC for current sensor
+  if (pin_current_sensor != GPIO_NUM_NC) {
+    analogReadResolution(12);          // 12-bit ADC
+    analogSetAttenuation(ADC_11db);    // Full 0-3.3V range
+  }
 
   // Set battery protocol name for web display
   strncpy(datalayer.system.info.battery_protocol, Name, 63);
@@ -280,7 +294,7 @@ void ChademoV2HBattery::processVehicleSession(const CAN_frame& frame) {
   uint16_t priorTargetVoltage = vehicleSession.targetBatteryVoltage;
 
   vehicleCanInitialized = true;
-  vehiclePermission = digitalRead(pin_j);
+  vehiclePermission = digitalRead(pin_vehicle_enable);  // CHAdeMO Pin 4
 
   // Byte 0: Protocol version
   vehicleSession.controlProtocolNumber = frame.data.u8[0];
@@ -647,37 +661,57 @@ void ChademoV2HBattery::runStateMachine() {
 }
 
 /**
- * IDLE State: Waiting for plug insertion
+ * IDLE State: Waiting for connection
+ *
+ * Kraftkranen: All relays OFF, waiting for vehicle to be connected.
+ * Since we don't have proximity sensor, we wait for user command or
+ * vehicle CAN messages to start.
  */
 void ChademoV2HBattery::handleStateIdle() {
-  // Ensure safe state
-  digitalWrite(pin_d1, LOW);
-  digitalWrite(pin_k, LOW);
-  digitalWrite(pin_lock, LOW);  // Unlock connector
+  // Ensure all relays are OFF (safe state)
+  digitalWrite(relay_main_pos, LOW);   // Relay 1: Main+ OFF
+  digitalWrite(relay_main_neg, LOW);   // Relay 2: Main- OFF
+  digitalWrite(relay_precharge, LOW);  // Relay 3: Precharge OFF
+  digitalWrite(relay_d1, LOW);         // Relay 4: d1 OFF
+  digitalWrite(relay_lock, LOW);       // Relay 5: Lock OFF
 
-  // Check for plug insertion
-  plugInserted = digitalRead(pin_pp);
+  contactorsReady = false;
+  plugInserted = false;
 
-  if (plugInserted) {
-    logging.println("CHAdeMO V2H: Plug inserted");
+  // Kraftkranen: No proximity sensor, check for vehicle CAN or manual start
+  // If we receive CAN from vehicle, that means it's connected
+  if (vehicleCanReceived) {
+    logging.println("CHAdeMO V2H: Vehicle CAN detected, starting handshake");
+    plugInserted = true;
     transitionToState(V2H_CONNECTED);
   }
 }
 
 /**
- * CONNECTED State: Plug inserted, starting communication
+ * CONNECTED State: Vehicle detected, starting handshake
+ *
+ * Kraftkranen Sequence Step 1: Engage Lock (R5) -> Start Signal (R4)
  */
 void ChademoV2HBattery::handleStateConnected() {
-  if (!plugInserted) {
-    // Plug removed
+  if (!vehicleCanReceived) {
+    // Lost vehicle communication
+    logging.println("CHAdeMO V2H: Lost vehicle CAN, returning to IDLE");
     transitionToState(V2H_IDLE);
     return;
   }
 
-  // Assert EVSE ready signal (Pin 2/d1)
-  digitalWrite(pin_d1, HIGH);
+  // Step 1: Engage connector lock (Relay 5)
+  digitalWrite(relay_lock, HIGH);
+  logging.println("CHAdeMO V2H: Connector LOCKED (Relay 5)");
 
-  // Transition to INIT - waiting for vehicle CAN
+  // Small delay for lock to engage
+  delay(KRAFTKRANEN_CONTACTOR_DELAY_MS);
+
+  // Step 2: Send "Charger Start" signal via Relay 4 (CHAdeMO Pin 2 / d1)
+  digitalWrite(relay_d1, HIGH);
+  logging.println("CHAdeMO V2H: Charger Start signal ON (Relay 4)");
+
+  // Transition to INIT - waiting for vehicle CAN response
   transitionToState(V2H_INIT);
 }
 
@@ -720,95 +754,142 @@ void ChademoV2HBattery::handleStateNegotiate() {
 
 /**
  * EV_ALLOWED State: Vehicle has granted permission
+ *
+ * Kraftkranen: Verify Vehicle Enable (Pin 4) is HIGH via voltage divider
  */
 void ChademoV2HBattery::handleStateEvAllowed() {
-  logging.println("CHAdeMO V2H: Vehicle permission granted");
+  logging.println("CHAdeMO V2H: Checking vehicle permission");
+
+  // Read Vehicle Enable signal (CHAdeMO Pin 4 via voltage divider)
+  vehiclePermission = digitalRead(pin_vehicle_enable);
 
   if (vehiclePermission) {
-    // Lock connector
-    digitalWrite(pin_lock, HIGH);
+    logging.println("CHAdeMO V2H: Vehicle Enable HIGH - permission granted");
+
+    // Lock should already be engaged from CONNECTED state
     evseStatus.connectorLocked = true;
 
-    // TODO: Add solenoid verification if available
-
     transitionToState(V2H_EVSE_PREPARE);
+  } else {
+    // Wait for vehicle to assert Pin 4
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 1000) {
+      logging.println("CHAdeMO V2H: Waiting for Vehicle Enable (Pin 4)...");
+      lastLog = millis();
+    }
   }
 }
 
 /**
  * EVSE_PREPARE State: Preparing for power transfer
+ *
+ * Kraftkranen: Vehicle permission confirmed, ready to start precharge sequence
  */
 void ChademoV2HBattery::handleStateEvsePrepare() {
-  logging.println("CHAdeMO V2H: EVSE preparing");
+  logging.println("CHAdeMO V2H: EVSE preparing for precharge");
 
-  // Verify voltage is safe before enabling
-  if (vehicleSession.statusVehicleChargingEnabled) {
-    if (getMeasuredVoltage() < CHADEMO_V2H_SAFE_VOLTAGE_V) {
-      // Enable charge signal (Pin 10/k)
-      digitalWrite(pin_k, HIGH);
-      evsePermission = true;
-    } else {
-      logging.printf("CHAdeMO V2H: Voltage too high for startup: %dV\n",
-                     getMeasuredVoltage());
-    }
+  // Verify vehicle still permits operation
+  if (vehicleSession.statusVehicleChargingEnabled && vehiclePermission) {
+    evsePermission = true;
 
     // Keep stop control asserted during preparation
     evseStatus.chgDischStopControl = true;
     evseStatus.evseStatus = false;
+
+    // Ready to start - transition to EVSE_START for precharge
+    transitionToState(V2H_EVSE_START);
   } else {
     // Vehicle withdrew permission
+    logging.println("CHAdeMO V2H: Vehicle withdrew permission");
     transitionToState(V2H_STOP);
   }
-
-  // State transition to EVSE_START happens in processVehicleSession
 }
 
 /**
- * EVSE_START State: Signaling start of session
+ * EVSE_START State: Begin Kraftkranen precharge sequence
+ *
+ * Kraftkranen Step 3: Engage Main- (R2) + Precharge (R3)
  */
 void ChademoV2HBattery::handleStateEvseStart() {
-  logging.println("CHAdeMO V2H: Starting session");
+  logging.println("CHAdeMO V2H: Starting precharge sequence");
 
-  // Allow contactor closure
-  datalayer.system.status.battery_allows_contactor_closing = true;
+  // Step 3: Engage Negative contactor (Relay 2)
+  digitalWrite(relay_main_neg, HIGH);
+  logging.println("CHAdeMO V2H: Main NEGATIVE engaged (Relay 2)");
+
+  delay(KRAFTKRANEN_CONTACTOR_DELAY_MS);
+
+  // Step 3: Engage Precharge relay (Relay 3)
+  digitalWrite(relay_precharge, HIGH);
+  logging.println("CHAdeMO V2H: PRECHARGE engaged (Relay 3)");
 
   evseStatus.chgDischStopControl = true;  // Still asserting stop
   evseStatus.evseStatus = false;
+
+  // Signal that precharge is in progress
+  datalayer.system.status.contactors_engaged = 3;  // 3 = precharging
 
   transitionToState(V2H_EVSE_CONTACTORS);
 }
 
 /**
- * EVSE_CONTACTORS State: Closing contactors
+ * EVSE_CONTACTORS State: Kraftkranen precharge sequence
+ *
+ * Kraftkranen Step 4: Wait 3 seconds for Deye capacitors to charge
+ * Kraftkranen Step 5: Engage Main+ (R1) -> Disengage Precharge (R3)
  */
 void ChademoV2HBattery::handleStateContactors() {
-  logging.println("CHAdeMO V2H: Contactor sequence");
+  static bool prechargeStarted = false;
+  static unsigned long prechargeStartTime = 0;
 
-  // Read contactor status (implementation depends on hardware)
-  bool prechargeComplete = (digitalRead(pin_precharge) == LOW);
-  bool contactorClosed = (digitalRead(pin_contactor) == HIGH);
-  contactorsReady = prechargeComplete && contactorClosed;
-
-  if (contactorsReady) {
-    logging.printf("CHAdeMO V2H: Contactors ready, voltage: %dV\n",
-                   getMeasuredVoltage());
-
-    // Verify both sides are discharge compatible
-    if (evseStatus.dischargeCompatible &&
-        vehicleSession.statusVehicleDischargeCompatible) {
-      // Clear stop control - enable power flow!
-      evseStatus.chgDischStopControl = false;
-      evseStatus.evseStatus = true;
-      transitionToState(V2H_POWERFLOW);
-    } else {
-      logging.println("CHAdeMO V2H: Discharge compatibility mismatch");
-      transitionToState(V2H_STOP);
-    }
+  if (!prechargeStarted) {
+    prechargeStartTime = millis();
+    prechargeStarted = true;
+    logging.println("CHAdeMO V2H: Precharging Deye capacitors...");
   }
 
-  // Timeout check
-  if (millis() - stateEntryTime > CHADEMO_V2H_PRECHARGE_TIMEOUT_MS) {
-    logging.println("CHAdeMO V2H: Contactor timeout");
+  // Step 4: Wait for precharge to complete (3 seconds)
+  unsigned long elapsed = millis() - prechargeStartTime;
+
+  if (elapsed < KRAFTKRANEN_PRECHARGE_TIME_MS) {
+    // Still precharging - log progress every second
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 1000) {
+      logging.printf("CHAdeMO V2H: Precharging... %lu/%d ms\n",
+                     elapsed, KRAFTKRANEN_PRECHARGE_TIME_MS);
+      lastLog = millis();
+    }
+    return;
+  }
+
+  // Step 5: Precharge complete - engage Main+ (Relay 1)
+  logging.println("CHAdeMO V2H: Precharge complete, engaging Main+");
+  digitalWrite(relay_main_pos, HIGH);
+  logging.println("CHAdeMO V2H: Main POSITIVE engaged (Relay 1)");
+
+  delay(KRAFTKRANEN_CONTACTOR_DELAY_MS);
+
+  // Step 5: Disengage Precharge relay (Relay 3)
+  digitalWrite(relay_precharge, LOW);
+  logging.println("CHAdeMO V2H: PRECHARGE disengaged (Relay 3)");
+
+  // All contactors closed!
+  contactorsReady = true;
+  prechargeStarted = false;
+  datalayer.system.status.contactors_engaged = 1;  // 1 = closed
+
+  logging.printf("CHAdeMO V2H: Contactors READY, voltage: %dV\n",
+                 getMeasuredVoltage());
+
+  // Verify V2H discharge compatibility
+  if (evseStatus.dischargeCompatible &&
+      vehicleSession.statusVehicleDischargeCompatible) {
+    // Clear stop control - enable power flow!
+    evseStatus.chgDischStopControl = false;
+    evseStatus.evseStatus = true;
+    transitionToState(V2H_POWERFLOW);
+  } else {
+    logging.println("CHAdeMO V2H: Discharge compatibility mismatch");
     transitionToState(V2H_STOP);
   }
 }
@@ -836,60 +917,122 @@ void ChademoV2HBattery::handleStatePowerflow() {
 
 /**
  * STOP State: Controlled shutdown
+ *
+ * Kraftkranen shutdown sequence (reverse of precharge):
+ * 1. Wait for current to drop to safe level
+ * 2. Disengage Main+ (R1)
+ * 3. Disengage Main- (R2) and Precharge (R3)
+ * 4. Turn off CHAdeMO signals (R4, R5)
  */
 void ChademoV2HBattery::handleStateStop() {
-  logging.println("CHAdeMO V2H: Stopping");
+  static bool shutdownStarted = false;
 
-  // Assert stop control
+  if (!shutdownStarted) {
+    logging.println("CHAdeMO V2H: Initiating controlled shutdown");
+    shutdownStarted = true;
+  }
+
+  // Assert stop control on CHAdeMO CAN
   evseStatus.chgDischStopControl = true;
   evseStatus.evseStatus = false;
   evsePermission = false;
   vehiclePermission = false;
 
-  // Prevent contactor closure
-  datalayer.system.status.battery_allows_contactor_closing = false;
-
   // Wait for current to drop before opening contactors
   // Per CHAdeMO spec: protect EV contactors from arc damage
-  if (abs(getMeasuredCurrent()) <= CHADEMO_V2H_SAFE_CURRENT_A &&
-      getMeasuredVoltage() <= CHADEMO_V2H_SAFE_VOLTAGE_V) {
-    // Safe to de-energize
-    digitalWrite(pin_k, LOW);   // Disable charge enable
-    digitalWrite(pin_d1, LOW);  // EVSE not ready
+  int16_t currentA = getMeasuredCurrent();
 
+  if (abs(currentA) <= CHADEMO_V2H_SAFE_CURRENT_A) {
+    logging.printf("CHAdeMO V2H: Current safe (%dA), opening contactors\n", currentA);
+
+    // Step 1: Disengage Main+ (Relay 1)
+    digitalWrite(relay_main_pos, LOW);
+    logging.println("CHAdeMO V2H: Main+ DISENGAGED (Relay 1)");
+
+    delay(KRAFTKRANEN_CONTACTOR_DELAY_MS);
+
+    // Step 2: Disengage Precharge if still on (Relay 3)
+    digitalWrite(relay_precharge, LOW);
+    logging.println("CHAdeMO V2H: Precharge DISENGAGED (Relay 3)");
+
+    // Step 3: Disengage Main- (Relay 2)
+    digitalWrite(relay_main_neg, LOW);
+    logging.println("CHAdeMO V2H: Main- DISENGAGED (Relay 2)");
+
+    delay(KRAFTKRANEN_CONTACTOR_DELAY_MS);
+
+    // Step 4: Turn off CHAdeMO signals
+    digitalWrite(relay_d1, LOW);   // Relay 4: Charger Start OFF
+    logging.println("CHAdeMO V2H: Charger Start OFF (Relay 4)");
+
+    digitalWrite(relay_lock, LOW); // Relay 5: Unlock connector
+    logging.println("CHAdeMO V2H: Connector UNLOCKED (Relay 5)");
+
+    contactorsReady = false;
+    datalayer.system.status.contactors_engaged = 0;  // 0 = open
+    shutdownStarted = false;
+
+    logging.println("CHAdeMO V2H: Shutdown complete");
     transitionToState(V2H_IDLE);
+    return;
+  }
+
+  // Log waiting for current to drop
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog > 1000) {
+    logging.printf("CHAdeMO V2H: Waiting for current to drop (%dA > %dA safe)\n",
+                   abs(currentA), CHADEMO_V2H_SAFE_CURRENT_A);
+    lastLog = millis();
   }
 
   // Timeout - force shutdown even if current high (safety concern!)
   if (millis() - stateEntryTime > CHADEMO_V2H_STOP_TIMEOUT_MS) {
-    logging.println("CHAdeMO V2H: Stop timeout, forcing shutdown");
-    digitalWrite(pin_k, LOW);
-    digitalWrite(pin_d1, LOW);
+    logging.println("CHAdeMO V2H: STOP TIMEOUT - forcing emergency shutdown!");
+
+    // Emergency: turn off all relays immediately
+    digitalWrite(relay_main_pos, LOW);
+    digitalWrite(relay_precharge, LOW);
+    digitalWrite(relay_main_neg, LOW);
+    digitalWrite(relay_d1, LOW);
+    digitalWrite(relay_lock, LOW);
+
+    contactorsReady = false;
+    datalayer.system.status.contactors_engaged = 0;
+    shutdownStarted = false;
+
     transitionToState(V2H_IDLE);
   }
 }
 
 /**
- * FAULT State: Error condition - requires power cycle
+ * FAULT State: Emergency shutdown - requires power cycle
+ *
+ * Kraftkranen EMERGENCY: Immediately turn off ALL relays.
+ * This state latches and cannot be cleared without power cycle.
  */
 void ChademoV2HBattery::handleStateFault() {
-  logging.println("CHAdeMO V2H: FAULT state - power cycle required");
+  logging.println("CHAdeMO V2H: FAULT - EMERGENCY SHUTDOWN!");
 
   // Set all error flags
   evseStatus.evseError = true;
   evseStatus.chgDischError = true;
   evseStatus.chgDischStopControl = true;
 
-  // De-energize everything
-  digitalWrite(pin_k, LOW);
-  digitalWrite(pin_d1, LOW);
+  // IMMEDIATELY turn off ALL relays - no delays, no waiting for current
+  digitalWrite(relay_main_pos, LOW);   // Relay 1: Main+ OFF
+  digitalWrite(relay_main_neg, LOW);   // Relay 2: Main- OFF
+  digitalWrite(relay_precharge, LOW);  // Relay 3: Precharge OFF
+  digitalWrite(relay_d1, LOW);         // Relay 4: CHAdeMO d1 OFF
+  digitalWrite(relay_lock, LOW);       // Relay 5: Lock OFF
 
   evsePermission = false;
   vehiclePermission = false;
-  datalayer.system.status.battery_allows_contactor_closing = false;
+  contactorsReady = false;
+  datalayer.system.status.contactors_engaged = 2;  // 2 = error
 
   // FAULT state can only be cleared by power cycle
   // This is a safety feature per CHAdeMO spec
+  logging.println("CHAdeMO V2H: All relays OFF - power cycle required to clear");
 }
 
 /* ============================================================================
@@ -942,15 +1085,22 @@ bool ChademoV2HBattery::checkDischargeCompatibility() {
 }
 
 /**
- * Emergency safety shutdown
+ * Emergency safety shutdown - turns off ALL Kraftkranen relays
  */
 void ChademoV2HBattery::safetyShutdown(const char* reason) {
   logging.printf("CHAdeMO V2H: SAFETY SHUTDOWN - %s\n", reason);
-  digitalWrite(pin_k, LOW);
-  digitalWrite(pin_d1, LOW);
+
+  // Immediately turn off all relays
+  digitalWrite(relay_main_pos, LOW);   // Relay 1
+  digitalWrite(relay_main_neg, LOW);   // Relay 2
+  digitalWrite(relay_precharge, LOW);  // Relay 3
+  digitalWrite(relay_d1, LOW);         // Relay 4
+  digitalWrite(relay_lock, LOW);       // Relay 5
+
   evsePermission = false;
   vehiclePermission = false;
-  datalayer.system.status.battery_allows_contactor_closing = false;
+  contactorsReady = false;
+  datalayer.system.status.contactors_engaged = 2;  // Error state
   transitionToState(V2H_FAULT);
 }
 
@@ -973,6 +1123,25 @@ int16_t ChademoV2HBattery::getMeasuredCurrent() {
   if (datalayer.shunt.available) {
     return datalayer.shunt.measured_amperage_dA / 10;  // Convert dA to A
   }
+
+  // Kraftkranen: Read from ACS758 Hall effect current sensor
+  if (pin_current_sensor != GPIO_NUM_NC) {
+    // Read ADC value (12-bit: 0-4095)
+    uint16_t adcValue = analogRead(pin_current_sensor);
+
+    // Convert ADC to millivolts
+    // Formula: mV = (adcValue / ADC_RESOLUTION) * ADC_REFERENCE_MV
+    uint32_t sensorMv = ((uint32_t)adcValue * ADC_REFERENCE_MV) / ADC_RESOLUTION;
+
+    // Convert millivolts to current
+    // ACS758: Output = VCC/2 at 0A, ±sensitivity per amp
+    // Formula: current = (sensorMv - zeroPoint) / sensitivity
+    int32_t currentMa = ((int32_t)sensorMv - ACS758_ZERO_CURRENT_MV) * 1000 / ACS758_SENSITIVITY_MV_PER_A;
+
+    // Return current in Amps
+    return (int16_t)(currentMa / 1000);
+  }
+
   // Fallback to battery current
   return datalayer.battery.status.current_dA / 10;
 }
